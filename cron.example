@@ -1,0 +1,3 @@
+# Replace the project path with its absolute path on the machine that runs this job.
+# This refresh scrapes and proposes only; it does not write CRM changes.
+0 8 * * * cd /absolute/path/to/bellhaven-crm-sync && .venv/bin/python -m bellhaven_crm_sync.cli refresh >> data/cron.log 2>&1
