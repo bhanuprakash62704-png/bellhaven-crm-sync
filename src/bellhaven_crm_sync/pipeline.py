@@ -1,3 +1,5 @@
+"""Read-only refresh orchestration that turns website and CRM snapshots into proposals."""
+
 from __future__ import annotations
 
 import json
@@ -17,19 +19,31 @@ def refresh_review_queue(
     client: CRMClient | None = None,
     communities: list[Community] | None = None,
 ) -> dict[str, Any]:
+    """Refresh scraper/API inputs and persist new or updated review evidence.
+
+    This function deliberately has no CRM write path. Approved writes are handled
+    separately by the review app after an explicit reviewer decision.
+    """
     load_local_env()
+    # Permit a fake/injected CRM client in tests and tools; normal CLI runs build
+    # the authenticated client from local configuration.
     crm_client = client or CRMClient()
+    # Explicit fixture data avoids network scraping in tests; production refreshes
+    # always take a new website snapshot.
     website_communities = communities if communities is not None else scrape_communities()
+    # Fail before reading or storing proposals if the configured sandbox token is invalid.
     crm_client.get_identity()
     crm_accounts = crm_client.get_all_accounts()
     proposals, summary = build_proposals(website_communities, crm_accounts)
     inserted_count = ReviewStore(database_path).add_proposals(proposals, summary)
+    # Keep both numbers: a proposal can be current but already present or decided.
     result = {
         **summary,
         "new_proposals_added": inserted_count,
         "already_seen_or_decided": len(proposals) - inserted_count,
     }
 
+    # Store a readable input snapshot beside the database to support manual QA.
     snapshot_path = Path(database_path).parent / "latest_communities.json"
     snapshot_path.write_text(
         json.dumps([community.to_dict() for community in website_communities], indent=2),

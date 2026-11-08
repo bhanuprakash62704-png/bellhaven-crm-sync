@@ -1,3 +1,5 @@
+"""Command-line entry points for scraping, refreshing, and launching local review."""
+
 from __future__ import annotations
 
 import argparse
@@ -11,7 +13,9 @@ from .webapp import serve
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Define explicit commands so read-only refresh and review serving stay distinct."""
     parser = argparse.ArgumentParser(description="Review Bellhaven website-to-CRM ownership and data changes.")
+    # Requiring a subcommand prevents an accidental no-op from looking successful.
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     refresh = subparsers.add_parser(
@@ -37,10 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Dispatch CLI commands; only the review app can execute approved CRM writes."""
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "scrape":
+        # This command reads public pages only and writes a local JSON snapshot.
         communities = scrape_communities()
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -52,13 +58,17 @@ def main() -> None:
         return
 
     if args.command == "refresh":
+        # Refresh only proposes changes; it has no CRM write operation.
         print(json.dumps(refresh_review_queue(args.db), indent=2))
         return
 
     if args.command == "run":
+        # Run the same proposal-only refresh before starting the reviewer.
         print(json.dumps(refresh_review_queue(args.db), indent=2))
 
     if args.command in {"serve", "run"}:
+        # Loading the token here prepares approved POST actions; serving the page
+        # itself and all GET requests remain read-only.
         load_local_env()
         serve(host=args.host, port=args.port, database_path=args.db)
 

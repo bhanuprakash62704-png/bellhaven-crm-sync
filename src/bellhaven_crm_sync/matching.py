@@ -1,3 +1,5 @@
+"""Evidence-based matching and safe proposal construction for Bellhaven CRM records."""
+
 from __future__ import annotations
 
 import hashlib
@@ -11,10 +13,12 @@ from .models import CRMAccount, Community, Proposal
 
 
 def normalize(value: str) -> str:
+    """Normalize names and scalar location fields for punctuation-insensitive comparison."""
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def normalize_address(value: str) -> str:
+    """Normalize common postal abbreviations while preserving address token order."""
     aliases = {
         "north": "n",
         "south": "s",
@@ -43,6 +47,7 @@ def normalize_address(value: str) -> str:
 
 
 def _address_key(account: CRMAccount | Community) -> tuple[str, str, str, str]:
+    """Build a composite location key; a street alone is not sufficient for deduplication."""
     return (
         normalize_address(account.address),
         normalize(account.city),
@@ -52,25 +57,32 @@ def _address_key(account: CRMAccount | Community) -> tuple[str, str, str, str]:
 
 
 def _candidate_score(community: Community, account: CRMAccount) -> tuple[int, list[str]]:
+    """Score identity/location evidence and return readable reasons for the score."""
     score = 0
     evidence: list[str] = []
     name_ratio = SequenceMatcher(
         None, normalize(community.name), normalize(account.name)
     ).ratio()
     if normalize(community.name) == normalize(account.name):
+        # Exact normalized names get more weight than approximate names.
         score += 45
         evidence.append("Community and CRM names match after punctuation/case normalization.")
     elif name_ratio >= 0.86:
+        # Similar names are useful evidence but need location corroboration.
         score += 30
         evidence.append(f"Community and CRM names are similar ({name_ratio:.0%}).")
 
     if normalize_address(community.address) and normalize_address(community.address) == normalize_address(account.address):
+        # Street matches carry substantial weight, but are not enough alone to
+        # auto-approve a match because addresses can be reused or incomplete.
         score += 40
         evidence.append("Street address matches.")
     if normalize(community.postal_code) and normalize(community.postal_code) == normalize(account.postal_code):
+        # ZIP is a strong geographic discriminator when both sides provide it.
         score += 10
         evidence.append("Postal code matches.")
     if normalize(community.city) and normalize(community.city) == normalize(account.city):
+        # City and state are supporting signals rather than identity by themselves.
         score += 8
         evidence.append("City matches.")
     if normalize(community.state) and normalize(community.state) == normalize(account.state):
@@ -80,6 +92,7 @@ def _candidate_score(community: Community, account: CRMAccount) -> tuple[int, li
 
 
 def _plausible_candidate(community: Community, account: CRMAccount) -> bool:
+    """Reject same-name records whose geographic evidence contradicts the website."""
     name_ratio = SequenceMatcher(
         None, normalize(community.name), normalize(account.name)
     ).ratio()
@@ -97,14 +110,20 @@ def _plausible_candidate(community: Community, account: CRMAccount) -> bool:
         for left, right in location_pairs
         if normalize(left) and normalize(right)
     ]
+    # Missing CRM location fields are not treated as contradictions, but populated
+    # fields must provide enough agreement to distinguish same-name facilities.
     location_matches = sum(normalize(left) == normalize(right) for left, right in populated_pairs)
+    # A full street match is strong; otherwise require a compatible name plus location.
     return (
         street_matches
         or (
+            # Nearly identical names may tolerate one missing/mismatched location field,
+            # but a record with no geographic agreement remains untrusted.
             name_ratio >= 0.9
             and (location_matches > 0 or not populated_pairs)
             and location_matches >= len(populated_pairs) - 1
         )
+        # Different but related names need multiple matching geographic fields.
         or (name_ratio >= 0.6 and location_matches >= 2)
     )
 
@@ -117,6 +136,7 @@ def _proposal(
     action: dict[str, Any],
     evidence: list[dict[str, Any]],
 ) -> Proposal:
+    """Assign a stable ID from the proposed action so reruns can preserve decisions."""
     identity = {
         "category": category,
         "account_id": account_id,
@@ -126,6 +146,8 @@ def _proposal(
     proposal_id = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:20]
+    # Evidence is deliberately excluded from identity: refreshed evidence for an
+    # unchanged action should update one pending proposal rather than create another.
     return Proposal(
         proposal_id=proposal_id,
         category=category,
@@ -138,6 +160,7 @@ def _proposal(
 
 
 def find_parent_account(accounts: list[CRMAccount]) -> CRMAccount:
+    """Require one unambiguous top-level Bellhaven account before proposing parent links."""
     candidates = [
         account
         for account in accounts
@@ -145,6 +168,7 @@ def find_parent_account(accounts: list[CRMAccount]) -> CRMAccount:
         and normalize(account.name).removesuffix("parentaccount") == "bellhavenseniorliving"
     ]
     if len(candidates) != 1:
+        # A guessed parent could cause writes to the wrong CRM hierarchy.
         raise ValueError(
             "Could not uniquely identify the Bellhaven Senior Living parent account. "
             f"Found {len(candidates)} exact top-level matches; inspect the CRM data."
@@ -156,8 +180,14 @@ def build_proposals(
     communities: list[Community],
     raw_accounts: list[dict[str, Any]],
 ) -> tuple[list[Proposal], dict[str, Any]]:
+    """Classify website communities and CRM child accounts without mutating CRM data.
+
+    Matching remains advisory: uncertain candidates and every proposed write are
+    represented as evidence-bearing proposals for a human to approve or reject.
+    """
     accounts = [CRMAccount.from_mapping(row) for row in raw_accounts]
     if any(not account.account_id for account in accounts):
+        # IDs are required for both audit evidence and any later approved write.
         raise ValueError("At least one CRM account response is missing its account id.")
     parent = find_parent_account(accounts)
     facilities = [account for account in accounts if account.account_id != parent.account_id]
@@ -171,12 +201,15 @@ def build_proposals(
             ((_candidate_score(community, account), account) for account in facilities),
             key=lambda item: (-item[0][0], item[1].account_id),
         )
+        # Prefer candidates with compatible location evidence; a global nearest-name
+        # match can otherwise attach a facility to an unrelated account in another state.
         plausible_ranked = [
             item for item in all_ranked if _plausible_candidate(community, item[1])
         ]
         ranked = plausible_ranked or all_ranked
         (score, match_evidence), account = ranked[0] if ranked else ((0, []), None)
         second_score = ranked[1][0][0] if len(ranked) > 1 else -1
+        # Automatically classify only a decisive full-address match or a separated score.
         clear_candidate = bool(
             account
             and (
@@ -203,6 +236,8 @@ def build_proposals(
 
         if not clear_candidate:
             if account and _plausible_candidate(community, account):
+                # Plausible but non-decisive candidates go to a reviewer; no field
+                # correction or parent change is inferred from a weak match.
                 proposals.append(
                     _proposal(
                         "ambiguous_match",
@@ -250,6 +285,8 @@ def build_proposals(
                     {"community": community.name, "classification": "ambiguous", "account_id": account.account_id, "score": score}
                 )
             else:
+                # Preserve the nearest candidate in evidence so reviewers can spot
+                # legacy names that the conservative plausibility gate excluded.
                 payload = {
                     "name": community.name,
                     "billing_street": community.address,
@@ -303,16 +340,23 @@ def build_proposals(
         )
         for field, website_value, crm_value in field_pairs:
             if field == "billing_street":
+                # Normalize common street abbreviations to avoid cosmetic updates.
                 normalized_website = normalize_address(website_value)
                 normalized_crm = normalize_address(crm_value)
+            elif field == "status":
+                # CRM status values are an enum with exact casing, not free-form text.
+                normalized_website = str(website_value).strip()
+                normalized_crm = str(crm_value).strip()
             else:
                 normalized_website = normalize(website_value)
                 normalized_crm = normalize(crm_value)
             if normalized_website != normalized_crm:
+                # Keep the website's literal value as the proposed correction.
                 changes[field] = website_value
 
         if account.parent_id != parent.account_id:
             if account.lifetime_revenue > 0 and account.outstanding_ar > 0:
+                # Billing SOP: retain the old account and create a linked replacement.
                 action = {
                     "kind": "billing_chow",
                     "create_payload": {
@@ -334,6 +378,7 @@ def build_proposals(
                 }
                 category = "billing_chow"
             else:
+                # The SOP permits direct reparenting if either billing condition is false.
                 action = {
                     "kind": "update_account",
                     "account_id": account.account_id,
@@ -342,6 +387,7 @@ def build_proposals(
                 }
                 category = "wrong_parent"
         elif changes:
+            # Parent is already correct; only propose fields that materially differ.
             action = {
                 "kind": "update_account",
                 "account_id": account.account_id,
@@ -350,6 +396,7 @@ def build_proposals(
             }
             category = "field_correction"
         else:
+            # A confident match with no material field drift needs no review action.
             classifications.append(
                 {"community": community.name, "classification": "confident_match", "account_id": account.account_id, "score": score}
             )
@@ -406,9 +453,13 @@ def build_proposals(
     duplicate_ids: set[str] = set()
     for group in duplicate_groups.values():
         if len(group) < 2:
+            # A single record at a location is not a duplicate candidate.
             continue
+        # Only infer a duplicate when exactly one same-location account is a website match.
         matched = [account for account in group if account.account_id in matched_website_keys]
         if len(matched) != 1:
+            # If zero or multiple records match the website, there is no safe,
+            # unambiguous survivor to reference in duplicate_of_account.
             continue
         survivor = matched[0]
         community = matched_communities[survivor.account_id]
@@ -466,8 +517,13 @@ def build_proposals(
             or account.account_id in matched_website_keys
             or account.account_id in duplicate_ids
         ):
+            # Accounts already matched or proposed as duplicates are not separately
+            # labeled stale, preventing duplicate/conflicting review actions.
             continue
+        # A name may be reused at another location; do not call it stale by name alone.
         if normalize(account.name) in website_names:
+            # Location mismatch still needs investigation; avoid asserting closure
+            # merely because a same-named community exists elsewhere.
             continue
         proposals.append(
             _proposal(
