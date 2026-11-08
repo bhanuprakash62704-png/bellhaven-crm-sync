@@ -20,7 +20,9 @@ BELLHAVEN_API_TOKEN=put-your-new-token-here
 BELLHAVEN_API_BASE=https://analyst-assessment-production.up.railway.app/api/v1
 ```
 
-`.env` is ignored by Git. Never commit or paste the token into source code.
+The app loads `.env` from the repository root, even if you launch it from another
+working directory. `.env` is ignored by Git. Never commit or paste the token into
+source code, a notebook, or a CSV file.
 
 ## Run
 

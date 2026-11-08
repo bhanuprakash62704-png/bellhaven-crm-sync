@@ -8,6 +8,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import bellhaven_crm_sync.api_client as api_client
 from bellhaven_crm_sync.api_client import (
     CRMClient,
     _records_from_response,
@@ -135,6 +136,26 @@ class APIClientTests(unittest.TestCase):
     def test_local_env_ignores_missing_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             load_local_env(Path(temp_dir) / "missing.env")
+
+    def test_local_env_defaults_to_repository_file_from_any_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "repository"
+            elsewhere = Path(temp_dir) / "elsewhere"
+            root.mkdir()
+            elsewhere.mkdir()
+            (root / ".env").write_text("BELLHAVEN_API_TOKEN=repo-token\n", encoding="utf-8")
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.object(api_client, "REPOSITORY_ROOT", root),
+                ):
+                    load_local_env()
+                    self.assertEqual(os.environ["BELLHAVEN_API_TOKEN"], "repo-token")
+            finally:
+                os.chdir(previous_cwd)
 
     def test_request_encodes_json_and_decodes_response(self):
         client = CRMClient(base_url="https://example.test/api/v1", token="test-token")
