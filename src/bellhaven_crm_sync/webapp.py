@@ -1,3 +1,5 @@
+"""Local-only review UI; an explicit approval is the sole path to CRM writes."""
+
 from __future__ import annotations
 
 import html
@@ -12,6 +14,7 @@ from .store import ReviewStore
 
 
 def _format_json(value: object) -> str:
+    """Escape evidence and action JSON before embedding it in HTML."""
     return html.escape(json.dumps(value, indent=2, ensure_ascii=False))
 
 
@@ -20,11 +23,14 @@ def _page(
     csrf_token: str,
     message: str = "",
 ) -> str:
+    """Render a review queue with evidence, proposed payloads, and decision history."""
     pending = store.list_proposals(("pending",))
+    # Keep finalized outcomes visible so the reviewer can verify what happened.
     history = store.list_proposals(("applied", "rejected", "failed", "approved", "superseded"))
     latest_run = store.latest_run()
     summary_html = ""
     if latest_run:
+        # Before the first refresh, the page remains usable with no summary block.
         summary = latest_run["summary"]
         summary_html = (
             f"<p>Last refresh: {html.escape(latest_run['created_at'])}. "
@@ -34,6 +40,7 @@ def _page(
         )
     pending_html = []
     for proposal in pending:
+        # Escape all stored evidence before inserting it into HTML.
         evidence = "".join(
             f"<li><strong>{html.escape(str(item.get('type', 'Evidence')).replace('_', ' ').title())}</strong>"
             f"<pre>{_format_json(item)}</pre></li>"
@@ -46,6 +53,7 @@ def _page(
             if website_url
             else ""
         )
+        # CRM-only proposals intentionally have no website link.
         proposal_id = html.escape(proposal["proposal_id"], quote=True)
         pending_html.append(
             f"""
@@ -64,6 +72,7 @@ def _page(
             """
         )
     if not pending_html:
+        # Show a useful empty state rather than leaving the reviewer unsure.
         pending_html.append('<p class="empty">The review queue is empty. Refresh the pipeline to check for new changes.</p>')
 
     history_html = "".join(
@@ -92,18 +101,34 @@ table{{width:100%;border-collapse:collapse}}td,th{{text-align:left;border-bottom
 </body></html>"""
 
 
-def serve(host: str = "127.0.0.1", port: int = 8000, database_path: str = "data/review.sqlite3") -> None:
+def create_review_server(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    database_path: str = "data/review.sqlite3",
+    *,
+    client: CRMClient | None = None,
+) -> ThreadingHTTPServer:
+    """Construct the local review server, allowing a fake client in integration tests.
+
+    The app intentionally refuses non-local bind addresses; it has no user-auth
+    layer and is designed for the assessment on the candidate's own machine. This
+    factory separates server construction from serving so tests can exercise real
+    HTTP requests without opening the real CRM or blocking a test process.
+    """
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("The review app must bind to localhost only.")
     load_local_env()
-    client = CRMClient()
+    crm_client = client or CRMClient()
     store = ReviewStore(database_path)
+    # A per-process token helps prevent cross-site form submissions against the local app.
     csrf_token = secrets.token_urlsafe(32)
 
     class ReviewHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            """Render the queue; GET requests never make CRM changes."""
             parsed = urlparse(self.path)
             if parsed.path != "/":
+                # Restrict the local server to the single review page.
                 self.send_error(404)
                 return
             message = parse_qs(parsed.query).get("message", [""])[0]
@@ -115,38 +140,47 @@ def serve(host: str = "127.0.0.1", port: int = 8000, database_path: str = "data/
             self.wfile.write(body)
 
         def do_POST(self) -> None:
+            """Validate a reviewer decision and, for approval only, execute its action."""
             parsed = urlparse(self.path)
             parts = parsed.path.strip("/").split("/")
             if len(parts) != 2 or parts[0] != "review":
+                # Reject unexpected write routes instead of dispatching arbitrary actions.
                 self.send_error(404)
                 return
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
                 if content_length <= 0 or content_length > 10_000:
+                    # Cap the form body to avoid accepting empty or oversized submissions.
                     raise ValueError("Invalid review form submission.")
                 form = parse_qs(self.rfile.read(content_length).decode("utf-8"))
                 if not secrets.compare_digest(form.get("csrf", [""])[0], csrf_token):
+                    # Constant-time comparison avoids leaking how much of a token matched.
                     raise PermissionError("Invalid review form token. Reload the page and try again.")
                 decision = form.get("decision", [""])[0]
                 proposal_id = parts[1]
                 if decision == "rejected":
+                    # Rejection is persisted locally and deliberately has no API call.
                     store.decide(proposal_id, "rejected")
                     message = "Proposal rejected. No CRM changes were made."
                 elif decision == "approved":
+                    # Persist approval before the request so an interrupted write is not replayed.
                     proposal = store.decide(proposal_id, "approved")
                     try:
-                        result = apply_action(client, proposal["action"])
+                        result = apply_action(crm_client, proposal["action"])
                         store.record_result(proposal_id, result)
                     except Exception as error:
                         store.record_error(proposal_id, str(error))
                         raise
                     message = "Approved proposal applied successfully."
                 else:
+                    # Only the two rendered form decisions are valid transitions.
                     raise ValueError("Choose approve or reject.")
                 self.send_response(303)
                 self.send_header("Location", f"/?message={quote(message)}")
                 self.end_headers()
             except Exception as error:
+                # Report validation, persistence, and CRM errors in the UI. Do not
+                # convert a failed approval into a success-shaped response.
                 message = f"Review failed: {error}"
                 self.send_response(303)
                 self.send_header(
@@ -159,8 +193,15 @@ def serve(host: str = "127.0.0.1", port: int = 8000, database_path: str = "data/
             print(f"[review-app] {format % args}")
 
     server = ThreadingHTTPServer((host, port), ReviewHandler)
+    return server
+
+
+def serve(host: str = "127.0.0.1", port: int = 8000, database_path: str = "data/review.sqlite3") -> None:
+    """Serve the review app on loopback until interrupted by the operator."""
+    server = create_review_server(host, port, database_path)
     print(f"Review app listening at http://{host}:{port} (Ctrl-C to stop)")
     try:
         server.serve_forever()
     finally:
+        # Close the listening socket on Ctrl-C or server failure.
         server.server_close()
