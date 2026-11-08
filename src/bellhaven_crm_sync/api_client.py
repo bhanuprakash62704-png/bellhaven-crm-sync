@@ -12,14 +12,17 @@ from typing import Any
 
 from .http_utils import trusted_ssl_context
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
-def load_local_env(path: str | Path = ".env") -> None:
+
+def load_local_env(path: str | Path | None = None) -> None:
     """Load simple KEY=VALUE entries without overriding the caller's environment.
 
-    Missing files are allowed because deployments may inject environment variables
-    directly. Existing process variables take precedence over values in the file.
+    By default, read the repository's .env so CLI invocations work from any
+    current directory. Missing files are allowed because deployments may inject
+    environment variables directly. Existing process variables take precedence.
     """
-    env_path = Path(path)
+    env_path = REPOSITORY_ROOT / ".env" if path is None else Path(path)
     if not env_path.is_file():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():

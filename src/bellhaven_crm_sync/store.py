@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .models import Proposal
 
@@ -17,7 +18,7 @@ class ReviewStore:
         self.path = Path(path)
         # SQLite creates the database file, but not missing parent directories.
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._connection() as connection:
             # CREATE IF NOT EXISTS makes startup safe for both first run and restart.
             connection.executescript(
                 """
@@ -52,6 +53,16 @@ class ReviewStore:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back each operation, then release the database handle."""
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def add_proposals(self, proposals: list[Proposal], summary: dict[str, Any]) -> int:
         """Upsert current pending evidence while preserving finalized decisions.
 
@@ -59,7 +70,7 @@ class ReviewStore:
         their decision history remains inspectable if a discrepancy later returns.
         """
         inserted = 0
-        with self._connect() as connection:
+        with self._connection() as connection:
             for proposal in proposals:
                 existing = connection.execute(
                     "SELECT status FROM proposals WHERE proposal_id = ?",
@@ -127,7 +138,7 @@ class ReviewStore:
 
     def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         """Return one proposal with its JSON fields decoded."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
             ).fetchone()
@@ -136,7 +147,7 @@ class ReviewStore:
 
     def list_proposals(self, statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """List proposals, optionally restricted to a set of workflow states."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             if statuses:
                 # Bind each requested status separately to avoid interpolating values.
                 placeholders = ",".join("?" for _ in statuses)
@@ -156,7 +167,7 @@ class ReviewStore:
         if decision not in {"approved", "rejected"}:
             # Keep the database state machine restricted to reviewer-supported choices.
             raise ValueError(f"Unsupported review decision: {decision}")
-        with self._connect() as connection:
+        with self._connection() as connection:
             # The status predicate prevents two browser submissions from both winning.
             cursor = connection.execute(
                 """
@@ -185,7 +196,7 @@ class ReviewStore:
 
     def record_result(self, proposal_id: str, result: dict[str, Any]) -> None:
         """Mark an approved action as applied after the API confirms success."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE proposals
@@ -200,7 +211,7 @@ class ReviewStore:
 
     def record_error(self, proposal_id: str, error: str) -> None:
         """Retain API failure details without making an unsafe automatic retry possible."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE proposals
@@ -215,7 +226,7 @@ class ReviewStore:
 
     def latest_run(self) -> dict[str, Any] | None:
         """Return the most recent refresh summary for the review page."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT summary_json, created_at FROM pipeline_runs ORDER BY run_id DESC LIMIT 1"
             ).fetchone()
